@@ -101,8 +101,31 @@ async function wealthWeapon(){
 async function generateAIBetslips(){
   const box=$('aiGenerateBox'); box.innerHTML='<div class="card">🧠 ULTRA is analyzing the existing board: data → specialists → predictions → critic → grading → fair odds → risk → betslips…</div>';
   try{
-    const r=await fetch('/api/ai/generate-betslips',{method:'POST'}); const x=await r.json();
-    if(!r.ok)throw new Error(x.detail||'Generation failed');
+    const r=await fetch('/api/ai/generate-betslips',{method:'POST'}); const job=await r.json();
+    if(!r.ok&&r.status!==202)throw new Error(job.detail||'Generation failed');
+    if(!job.job_id)throw new Error('Server did not return a job id');
+    // Analysis runs in the background; poll the job every 2.5s, capped at 10 minutes.
+    const started=Date.now(), POLL_MS=2500, CAP_MS=10*60*1000;
+    let x=null, failures=0;
+    while(true){
+      await new Promise(res=>setTimeout(res,POLL_MS));
+      const elapsed=Math.round((Date.now()-started)/1000);
+      if(Date.now()-started>CAP_MS)throw new Error('Timed out waiting for analysis. It may still finish; reopen this page shortly to see the latest result.');
+      let j;
+      try{
+        const pr=await fetch('/api/ai/betslip-jobs/'+encodeURIComponent(job.job_id));
+        if(pr.status===404)throw new Error('Job no longer exists (the service may have restarted). Please try again.');
+        if(!pr.ok)throw new Error('Status check failed ('+pr.status+')');
+        j=await pr.json(); failures=0;
+      }catch(pe){
+        if(/Job no longer exists/.test(pe.message))throw pe;
+        if(++failures>=5)throw pe; // tolerate brief network drops on mobile
+        continue;
+      }
+      if(j.status==='DONE'){x=j.result||{};break}
+      if(j.status==='FAILED')throw new Error(j.error||'Generation failed');
+      box.innerHTML=`<div class="card">🧠 ULTRA is analyzing the board in the background… ${elapsed}s elapsed. You can keep this page open; results appear automatically.</div>`;
+    }
     const elite=x.grade_90_plus||[];
     const op=x.manager_one_pick;
     const opHtml=op?`<div class="card" style="border:1px solid #2b6cb0"><b>🎯 ULTRA ONE PICK</b><div class="matchtop"><div><b>${op.match}</b><div class="muted">${op.league||''}</div></div><span class="decision good">${op.pick.label} • ${op.pick.joint_probability}% joint P</span></div><p class="muted">${op.why}</p>${(op.rejected_5||[]).map(r=>`<div class="row"><span>${r.code}</span><span class="muted">Rejected: ${r.reason}</span></div>`).join('')}</div>`:`<div class="card"><b>🎯 ULTRA ONE PICK: PROVISIONAL</b><p class="muted">No match cleared the evidence and grade gates.</p></div>`;
