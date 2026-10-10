@@ -1,5 +1,5 @@
 from __future__ import annotations
-import asyncio, json, math, os, random, re, sqlite3, statistics
+import asyncio, json, math, os, random, re, sqlite3, statistics, uuid
 from urllib.parse import quote
 from contextlib import contextmanager
 from datetime import datetime, timezone, timedelta
@@ -8,7 +8,7 @@ from typing import Any
 from concurrent.futures import ThreadPoolExecutor
 import httpx
 from fastapi import FastAPI, HTTPException, Header
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel, Field
 
 BASE=Path(__file__).resolve().parent
@@ -747,6 +747,11 @@ def init_db():
             created_at TEXT NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_betslip_memory_slip ON betslip_memory(slip_id, id);
+        CREATE TABLE IF NOT EXISTS betslip_jobs(
+            id TEXT PRIMARY KEY, kind TEXT NOT NULL DEFAULT 'FULL', status TEXT NOT NULL,
+            created_at TEXT NOT NULL, updated_at TEXT NOT NULL, result TEXT, error TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_betslip_jobs_kind ON betslip_jobs(kind, status, created_at);
         CREATE TABLE IF NOT EXISTS manager_events(
             id INTEGER PRIMARY KEY AUTOINCREMENT, event_type TEXT NOT NULL,
             fixture_id TEXT, strategy TEXT, payload TEXT NOT NULL, created_at TEXT NOT NULL
@@ -1820,9 +1825,9 @@ def _record_manager_event(event_type, fixture_id=None, strategy=None, payload=No
     with db() as c:
         c.execute("INSERT INTO manager_events(event_type,fixture_id,strategy,payload,created_at) VALUES(?,?,?,?,?)",(event_type,str(fixture_id) if fixture_id else None,str(strategy) if strategy else None,json.dumps(payload or {}),now().isoformat()))
 
-@app.post('/api/ai/generate-betslips')
-async def generate_ai_betslips():
+async def _generate_ai_betslips_full():
     """One deliberate AI analysis pass over the already fetched board.
+    Executed as a background job by POST /api/ai/generate-betslips (see betslip job store).
     The manager publishes pre-match selections for every available not-started match. 90+ remains a performance grade, not a publication gate.
     """
     _refresh_prediction_results(); _refresh_slip_statuses()
@@ -3430,9 +3435,112 @@ async def generate_ai_betslips():
         "pricing":"fair=1/joint; customer=fair*0.88"
     }
 
+# ========================= BETSLIP BACKGROUND JOBS =========================
+# The full analysis (board build + four slip passes + per-match rows) can take
+# minutes, far longer than mobile clients wait. The HTTP endpoints therefore only
+# create/poll a job; the analysis runs in an asyncio task. Jobs are persisted in
+# the betslip_jobs table so results survive until the container restarts.
+# Board building still goes through matches_board(), which serialises cold builds
+# with _BOARD_LOCK, so concurrent jobs do not stampede the providers.
+BETSLIP_JOB_TIMEOUT_SECONDS = max(60, int(os.getenv('BETSLIP_JOB_TIMEOUT_SECONDS','900')))
+_BETSLIP_JOB_TASKS: dict[str, asyncio.Task] = {}  # strong references so tasks are not garbage collected
+_BETSLIP_JOB_KEEP = 50
+
+try:
+    with db() as _c:
+        _c.execute("UPDATE betslip_jobs SET status='FAILED',error='Interrupted by service restart',updated_at=? WHERE status IN ('PENDING','RUNNING')",(now().isoformat(),))
+except Exception:
+    pass
+
+def _betslip_job_set(job_id, status, result=None, error=None):
+    with db() as c:
+        c.execute("UPDATE betslip_jobs SET status=?,updated_at=?,result=COALESCE(?,result),error=? WHERE id=?",
+                  (status, now().isoformat(), json.dumps(result,default=str) if result is not None else None, error, job_id))
+
+def _betslip_job_row(job_id):
+    with db() as c:
+        return c.execute("SELECT * FROM betslip_jobs WHERE id=?",(job_id,)).fetchone()
+
+def _betslip_job_view(row, include_result=True):
+    out={'job_id':row['id'],'status':row['status'],'created_at':row['created_at'],'updated_at':row['updated_at']}
+    if row['status']=='DONE' and include_result:
+        try: out['result']=json.loads(row['result']) if row['result'] else None
+        except Exception: out['result']=None
+    if row['status']=='FAILED':
+        out['error']=row['error']
+    return out
+
+def _latest_done_betslip_job():
+    with db() as c:
+        return c.execute("SELECT * FROM betslip_jobs WHERE kind='FULL' AND status='DONE' ORDER BY updated_at DESC LIMIT 1").fetchone()
+
+def _betslip_job_age_seconds(row):
+    try: return (now()-datetime.fromisoformat(row['updated_at'])).total_seconds()
+    except Exception: return float('inf')
+
+def _active_betslip_job_id():
+    for jid,t in list(_BETSLIP_JOB_TASKS.items()):
+        if not t.done(): return jid
+    return None
+
+async def _run_betslip_job(job_id):
+    try:
+        _betslip_job_set(job_id,'RUNNING')
+        result=await asyncio.wait_for(_generate_ai_betslips_full(), timeout=BETSLIP_JOB_TIMEOUT_SECONDS)
+        _betslip_job_set(job_id,'DONE',result=result if result is not None else {})
+    except asyncio.CancelledError:
+        try: _betslip_job_set(job_id,'FAILED',error='Cancelled')
+        except Exception: pass
+        raise
+    except asyncio.TimeoutError:
+        _record_source_error('AI Manager',f'betslip job {job_id} timed out')
+        _betslip_job_set(job_id,'FAILED',error=f'Timed out after {BETSLIP_JOB_TIMEOUT_SECONDS}s')
+    except Exception as e:
+        try: _record_source_error('AI Manager',f'betslip job {job_id}: {e}')
+        except Exception: pass
+        _betslip_job_set(job_id,'FAILED',error=str(e)[:500] or e.__class__.__name__)
+
+def _start_betslip_job():
+    """Start a job, or return the id of the job already running (no duplicate analysis passes)."""
+    active=_active_betslip_job_id()
+    if active:
+        return active, False
+    job_id=uuid.uuid4().hex
+    ts=now().isoformat()
+    with db() as c:
+        c.execute("INSERT INTO betslip_jobs(id,kind,status,created_at,updated_at) VALUES(?,?,?,?,?)",(job_id,'FULL','PENDING',ts,ts))
+        c.execute("DELETE FROM betslip_jobs WHERE id NOT IN (SELECT id FROM betslip_jobs ORDER BY created_at DESC LIMIT ?)",(_BETSLIP_JOB_KEEP,))
+    task=asyncio.create_task(_run_betslip_job(job_id))
+    _BETSLIP_JOB_TASKS[job_id]=task
+    task.add_done_callback(lambda _t,_id=job_id: _BETSLIP_JOB_TASKS.pop(_id,None))
+    return job_id, True
+
+@app.post('/api/ai/generate-betslips')
+async def generate_betslips_post():
+    job_id,_created=_start_betslip_job()
+    return JSONResponse(status_code=202,content={'job_id':job_id,'status':'RUNNING'},headers={'Location':f'/api/ai/betslip-jobs/{job_id}'})
+
+@app.get('/api/ai/betslip-jobs/{job_id}')
+async def get_betslip_job(job_id:str):
+    row=_betslip_job_row(job_id)
+    if not row: raise HTTPException(404,'Unknown betslip job')
+    return _betslip_job_view(row)
+
+@app.get('/api/ai/betslips/latest')
+async def get_latest_betslips():
+    row=_latest_done_betslip_job()
+    if not row:
+        return {'status':'EMPTY','job_id':None,'result':None}
+    return _betslip_job_view(row)
+
 @app.get("/api/ai/generate-betslips")
 async def generate_betslips_get():
-    return await generate_ai_betslips()
+    # Backward compatible: serve a recent result if one exists, otherwise start a job.
+    row=_latest_done_betslip_job()
+    if row and _betslip_job_age_seconds(row) < AUTO_SLIP_MIN_INTERVAL:
+        return _betslip_job_view(row)
+    job_id,_created=_start_betslip_job()
+    return JSONResponse(status_code=202,content={'job_id':job_id,'status':'RUNNING'},headers={'Location':f'/api/ai/betslip-jobs/{job_id}'})
 
 
 
